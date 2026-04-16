@@ -7,16 +7,17 @@ permissions:
   contents: write
 
 jobs:
-  contents-api:
-    name: "Contents API: %2F in file paths"
+  octokit-contents:
+    name: "Octokit: %2F in contents API paths"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: "Setup: create .github/test-file via unencoded path"
+      - name: "Setup: create .github/test-file via {+path} (baseline)"
         uses: actions/github-script@v7
         with:
           script: |
+            // {+path} = RFC 6570 reserved expansion, preserves / as literal slash
             await github.request('PUT /repos/{owner}/{repo}/contents/{+path}', {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -24,14 +25,23 @@ jobs:
               message: 'test: create file for encoding PoC',
               content: Buffer.from('hello from the encoding bug PoC\n').toString('base64')
             });
-            console.log('Created .github/test-file via {+path} (slashes preserved)');
+            console.log('Created .github/test-file via {+path} (slashes preserved in URL)');
 
-      - name: "Test 1: READ .github/test-file via repos.getContent (encodes / as %2F)"
+      - name: "Test 1: READ .github/test-file via repos.getContent() — uses {path}, encodes / as %2F"
         uses: actions/github-script@v7
         with:
           script: |
+            // repos.getContent() uses RFC 6570 simple expansion {path}
+            // which encodes / as %2F via encodeURIComponent
+            //
+            // The HTTP request sent is:
+            //   GET /repos/emilva/github-encoding-bug/contents/.github%2Ftest-file
+            //
+            // Before ~April 8-9 2026: server decoded %2F -> found .github/test-file
+            // After:                   server treats %2F literally -> 404
+
             console.log('github.rest.repos.getContent({ path: ".github/test-file" })');
-            console.log('Sends: GET /repos/.../contents/.github%2Ftest-file');
+            console.log('HTTP: GET /repos/.../contents/.github%2Ftest-file');
             console.log('');
             try {
               const { data } = await github.rest.repos.getContent({
@@ -40,18 +50,28 @@ jobs:
                 path: '.github/test-file'
               });
               console.log(`RESULT: Found file at ${data.path}`);
-              console.log('VERDICT: Server decoded %2F -> old behavior still works');
+              console.log('VERDICT: %2F decoded by server (old behavior, not broken)');
             } catch (e) {
               console.log(`RESULT: ${e.status} Not Found`);
-              console.log('VERDICT: Server treated %2F literally -> BUG');
+              console.log('VERDICT: %2F treated literally by server — BUG CONFIRMED');
+              console.log('');
+              console.log('The Octokit REST client correctly percent-encodes / as %2F');
+              console.log('per RFC 3986, but the server no longer decodes it back to /.');
+              console.log('This breaks repos.getContent() for any path with / (e.g. .github/CODEOWNERS).');
             }
 
-      - name: "Test 2: READ .github/test-file via request({+path}) (preserves /)"
+      - name: "Test 2: READ .github/test-file via request({+path}) — workaround, preserves /"
         uses: actions/github-script@v7
         with:
           script: |
+            // github.request with {+path} uses RFC 6570 reserved expansion
+            // which preserves / as literal slash in the URL
+            //
+            // HTTP request: GET /repos/.../contents/.github/test-file
+            // This always works because / is never encoded.
+
             console.log('github.request("GET .../contents/{+path}", { path: ".github/test-file" })');
-            console.log('Sends: GET /repos/.../contents/.github/test-file');
+            console.log('HTTP: GET /repos/.../contents/.github/test-file');
             console.log('');
             try {
               const { data } = await github.request('GET /repos/{owner}/{repo}/contents/{+path}', {
@@ -65,12 +85,21 @@ jobs:
               console.log(`RESULT: ${e.status} ${e.message}`);
             }
 
-      - name: "Test 3: CREATE .github/poc-file via createOrUpdateFileContents (encodes / as %2F)"
+      - name: "Test 3: CREATE .github/poc-file via createOrUpdateFileContents() — uses {path}, encodes / as %2F"
         uses: actions/github-script@v7
         with:
           script: |
+            // createOrUpdateFileContents() uses RFC 6570 simple expansion {path}
+            // which encodes / as %2F
+            //
+            // HTTP request: PUT /repos/.../contents/.github%2Fpoc-file
+            //
+            // Before: server decoded %2F -> created file at .github/poc-file
+            // After:  server treats %2F literally -> creates a ROOT-LEVEL file
+            //         named ".github%2Fpoc-file" (literal percent-two-F in name)
+
             console.log('github.rest.repos.createOrUpdateFileContents({ path: ".github/poc-file" })');
-            console.log('Sends: PUT /repos/.../contents/.github%2Fpoc-file');
+            console.log('HTTP: PUT /repos/.../contents/.github%2Fpoc-file');
             console.log('');
             try {
               const { data } = await github.rest.repos.createOrUpdateFileContents({
@@ -83,9 +112,13 @@ jobs:
               const p = data.content.path;
               console.log(`RESULT: File created at: ${p}`);
               if (p.includes('%2F')) {
-                console.log('VERDICT: BUG - file created with literal %2F in name');
+                console.log('VERDICT: BUG CONFIRMED — file created with literal %2F in name');
+                console.log(`  Expected path: .github/poc-file`);
+                console.log(`  Actual path:   ${p}`);
+                console.log('');
+                console.log('This is how .github/CODEOWNERS becomes .github%2FCODEOWNERS');
               } else {
-                console.log('VERDICT: Server decoded %2F -> old behavior still works');
+                console.log('VERDICT: %2F decoded by server (old behavior, not broken)');
               }
             } catch (e) {
               console.log(`RESULT: ${e.status} ${e.message}`);
@@ -109,123 +142,9 @@ jobs:
               } catch { /* ignore */ }
             }
 
-  environments-api:
-    name: "Environments API: %2F in environment names"
-    runs-on: ubuntu-latest
-    steps:
-      - name: "Setup: create environment 'test / slash' via Octokit request (preserves /)"
-        uses: actions/github-script@v7
-        with:
-          script: |
-            // Use Octokit request to create environment - slash preserved in URL
-            const envName = 'test / slash';
-            console.log(`Creating environment: "${envName}"`);
-            console.log('URL: PUT /repos/.../environments/test%20/%20slash (slash preserved)');
-            console.log('');
-            try {
-              const { data } = await github.request('PUT /repos/{owner}/{repo}/environments/{environment_name}', {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                environment_name: envName
-              });
-              console.log(`Created environment: "${data.name}"`);
-            } catch (e) {
-              console.log(`Failed: ${e.status} ${e.message}`);
-              console.log('Note: GITHUB_TOKEN may not have environments permission on this repo.');
-              console.log('If 404, try enabling environments in repo settings first.');
-            }
-
-      - name: "Test 1: READ 'test / slash' via %2F-encoded request"
-        uses: actions/github-script@v7
-        with:
-          script: |
-            // Manually construct URL with %2F (simulating what a percent-encoding client does)
-            const encoded = 'test%20%2F%20slash';
-            console.log(`Reading via manually encoded path: /environments/${encoded}`);
-            console.log('');
-            try {
-              // Use request with {+path} so we control the exact encoding
-              const { data } = await github.request('GET /repos/{owner}/{repo}/environments/{+env}', {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                env: encoded
-              });
-              console.log(`RESULT: Found environment "${data.name}"`);
-              if (data.name === 'test / slash') {
-                console.log('VERDICT: Server decoded %2F back to / -> old behavior');
-              } else {
-                console.log(`VERDICT: Server returned "${data.name}" which may have literal %2F`);
-              }
-            } catch (e) {
-              console.log(`RESULT: ${e.status} Not Found`);
-              console.log('VERDICT: Server treated %2F literally -> BUG');
-            }
-
-      - name: "Test 2: CREATE 'test / slash' via %2F-encoded PUT (duplicate test)"
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const encoded = 'test%20%2F%20slash';
-            console.log(`Creating via encoded path: PUT /environments/${encoded}`);
-            console.log('If %2F is treated literally, this creates a DUPLICATE environment');
-            console.log('');
-            try {
-              const { data } = await github.request('PUT /repos/{owner}/{repo}/environments/{+env}', {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                env: encoded
-              });
-              console.log(`Created/updated: "${data.name}"`);
-              if (data.name.includes('%2F')) {
-                console.log('VERDICT: BUG - environment created with literal %2F in name');
-              } else {
-                console.log('VERDICT: Server decoded %2F -> no duplicate');
-              }
-            } catch (e) {
-              console.log(`Failed: ${e.status} ${e.message}`);
-            }
-
-      - name: "Test 3: List all environments (check for duplicates)"
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { data } = await github.request('GET /repos/{owner}/{repo}/environments', {
-              owner: context.repo.owner,
-              repo: context.repo.repo
-            });
-            const envs = data.environments || [];
-            console.log(`Total environments: ${envs.length}`);
-            for (const env of envs) {
-              console.log(`  - "${env.name}"`);
-            }
-            console.log('');
-            if (envs.length > 1) {
-              console.log('VERDICT: BUG - duplicate environments created via %2F encoding');
-            } else if (envs.length === 1) {
-              console.log('VERDICT: No duplicates - server handled encoding correctly');
-            } else {
-              console.log('VERDICT: No environments found (setup may have failed)');
-            }
-
-      - name: "Cleanup"
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            // Try deleting both possible variants
-            for (const env of ['test%20/%20slash', 'test%20%2F%20slash']) {
-              try {
-                await github.request('DELETE /repos/{owner}/{repo}/environments/{+env}', {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  env: env
-                });
-                console.log(`Deleted via: ${env}`);
-              } catch { /* ignore */ }
-            }
-
-  gh-cli-api:
-    name: "gh CLI: %2F in API paths"
+  gh-cli-contents:
+    name: "gh CLI: %2F in contents API paths"
+    needs: octokit-contents
     runs-on: ubuntu-latest
     steps:
       - name: "Setup: create .github/test-gh-cli via unencoded path"
@@ -234,26 +153,30 @@ jobs:
         run: |
           content=$(echo "test content" | base64)
           gh api -X PUT "repos/${{ github.repository }}/contents/.github/test-gh-cli" \
-            -f message="test: create via gh api (unencoded)" \
+            -f message="test: create via gh api (unencoded slash)" \
             -f content="$content" \
             --jq '.content.path'
 
-      - name: "Test 1: READ via gh api with %2F-encoded path"
+      - name: "Test 1: READ .github/test-gh-cli via %2F-encoded path"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # gh api passes the URL path as-is to the HTTP client.
+          # If we manually encode / as %2F in the path, the server
+          # should decode it back to / — but does it?
+
           echo "gh api repos/.../contents/.github%2Ftest-gh-cli"
           echo ""
           if path=$(gh api "repos/${{ github.repository }}/contents/.github%2Ftest-gh-cli" \
             --jq '.path' 2>&1); then
             echo "RESULT: Found at $path"
-            echo "VERDICT: Server decoded %2F -> old behavior"
+            echo "VERDICT: %2F decoded by server (old behavior)"
           else
             echo "RESULT: 404 Not Found"
-            echo "VERDICT: Server treated %2F literally -> BUG"
+            echo "VERDICT: %2F treated literally by server — BUG CONFIRMED"
           fi
 
-      - name: "Test 2: READ via gh api with unencoded path"
+      - name: "Test 2: READ .github/test-gh-cli via unencoded path (control)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -262,9 +185,30 @@ jobs:
           if path=$(gh api "repos/${{ github.repository }}/contents/.github/test-gh-cli" \
             --jq '.path' 2>&1); then
             echo "RESULT: Found at $path"
-            echo "VERDICT: Unencoded slash works"
+            echo "VERDICT: Unencoded slash works (as expected)"
           else
-            echo "RESULT: Not Found"
+            echo "RESULT: Not Found (unexpected)"
+          fi
+
+      - name: "Test 3: CREATE .github/poc-gh-cli via %2F-encoded path"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # This tests whether creating a file via %2F-encoded path
+          # creates it at the correct location or with %2F in the name
+
+          echo "gh api -X PUT repos/.../contents/.github%2Fpoc-gh-cli"
+          echo ""
+          content=$(echo "test" | base64)
+          path=$(gh api -X PUT "repos/${{ github.repository }}/contents/.github%2Fpoc-gh-cli" \
+            -f message="test: create via %2F-encoded path" \
+            -f content="$content" \
+            --jq '.content.path' 2>&1) || true
+          echo "RESULT: File created at: $path"
+          if echo "$path" | grep -q '%2F'; then
+            echo "VERDICT: BUG CONFIRMED — file created with literal %2F in name"
+          else
+            echo "VERDICT: %2F decoded by server (old behavior)"
           fi
 
       - name: "Cleanup"
@@ -272,7 +216,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for path in ".github/test-gh-cli" ".github%2Ftest-gh-cli"; do
+          for path in ".github/test-gh-cli" ".github/poc-gh-cli" ".github%2Fpoc-gh-cli"; do
             sha=$(gh api "repos/${{ github.repository }}/contents/$path" --jq '.sha' 2>/dev/null) || continue
             gh api -X DELETE "repos/${{ github.repository }}/contents/$path" \
               -f message="cleanup" -f sha="$sha" 2>/dev/null && echo "Deleted: $path" || true

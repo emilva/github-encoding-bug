@@ -9,20 +9,14 @@ Around April 8-9 2026, GitHub's API changed how it handles `%2F` in URL paths. P
 This breaks any client that correctly percent-encodes path parameters per RFC 3986, including:
 
 - **@octokit/rest** - `repos.getContent({ path: '.github/CODEOWNERS' })` sends `.github%2FCODEOWNERS` via RFC 6570 simple expansion `{path}`
-- **gh CLI** - `gh api "repos/.../environments/$encoded_name/secrets"` where the name was encoded with `%2F`
+- **gh CLI** - `gh api "repos/.../contents/.github%2FCODEOWNERS"` when the path is percent-encoded
 - **Any HTTP client** following RFC 3986 URL encoding rules
 
-## Impact
+## Impact on Contents API
 
-### Contents API
-
-- `getContent({ path: '.github/CODEOWNERS' })` returns 404
-- `createOrUpdateFileContents({ path: '.github/CODEOWNERS' })` creates a file literally named `.github%2FCODEOWNERS` in the repo root
-
-### Environments API
-
-- Creating an environment via `%2F`-encoded name creates a duplicate with `%2F` in its name
-- Looking up an environment via `%2F`-encoded name returns 404
+- `getContent({ path: '.github/CODEOWNERS' })` returns **404** because the server looks for a file literally named `.github%2FCODEOWNERS`
+- `createOrUpdateFileContents({ path: '.github/CODEOWNERS' })` creates a **root-level file** named `.github%2FCODEOWNERS` instead of `.github/CODEOWNERS`
+- Any Octokit REST method using `{path}` expansion with paths containing `/` is affected
 
 ## Run the PoC
 
@@ -30,9 +24,14 @@ This breaks any client that correctly percent-encodes path parameters per RFC 39
 2. Click "Run workflow"
 3. Check the logs for each test step
 
-## Workaround
+The workflow runs two jobs:
 
-### Octokit
+| Job | What it tests |
+|-----|---------------|
+| **Octokit** | `repos.getContent()` and `createOrUpdateFileContents()` with `{path}` vs `{+path}` |
+| **gh CLI** | `gh api` with `%2F`-encoded vs unencoded paths |
+
+## Workaround
 
 Use `github.request()` with RFC 6570 reserved expansion `{+path}` instead of `github.rest.repos.*`:
 
@@ -44,16 +43,4 @@ await github.rest.repos.getContent({ owner, repo, path: '.github/CODEOWNERS' });
 await github.request('GET /repos/{owner}/{repo}/contents/{+path}', {
   owner, repo, path: '.github/CODEOWNERS'
 });
-```
-
-### Shell / gh CLI
-
-Don't encode `/` when URL-encoding path parameters:
-
-```bash
-# Broken: safe='' encodes / as %2F
-encoded=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))" <<< "$name")
-
-# Working: safe='/' preserves /
-encoded=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe='/'))" <<< "$name")
 ```
